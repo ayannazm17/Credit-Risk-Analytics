@@ -1,0 +1,779 @@
+---
+title: "IB98D0 – Advanced Data Analytics"
+author: "Group-5"
+subtitle: "Group Assignment – Q1,Q2"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    toc_depth: 2
+  pdf_document:
+    toc: true
+    toc_depth: 2
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(caret)
+library(ggplot2)
+library(rsample)
+library(here)
+library(corrplot)
+library(cluster)
+library(gridExtra)
+library(scales)
+```
+
+
+# Objective
+
+This analysis compares two different approaches to loan approval using a simulated A/B testing framework. The goal is to understand how stricter (Policy A, which focuses on minimising risk) versus more growth-oriented (Policy B, which focuses on maximising revenue) decision rules affect approval rates, default risk, and overall profitability. By examining these trade-offs, we aim to determine which strategy better balances expansion with prudent risk management in line with the company’s lending objectives.
+
+
+# Data Preparation
+
+```{r load_data}
+df_raw <- read.csv("early_2012_2013_loan_sample_with_outcome.csv")
+
+df <- df_raw %>%
+  filter(loan_status %in% c("Fully Paid", "Charged Off")) %>%
+  mutate(
+    default_flag = ifelse(loan_status == "Charged Off", 1, 0),
+    revol_util = as.numeric(gsub("%", "", revol_util)),
+    int_rate = as.numeric(gsub("%", "", int_rate)),
+    RealisedProfit =
+      total_rec_prncp +
+      total_rec_int +
+      recoveries -
+      funded_amnt -
+      collection_recovery_fee
+  ) %>%
+  select(
+    id, default_flag, grade, annual_inc, dti,
+    delinq_2yrs, inq_last_6mths,
+    open_acc, pub_rec, revol_bal, total_acc,
+    revol_util, int_rate, funded_amnt,
+    RealisedProfit
+  ) %>%
+  na.omit()
+
+
+```
+
+We focus only on loans that have been fully completed so that we can clearly observe their final outcomes. This ensures that profit and default results are based on actual realised performance rather than ongoing loans whose outcomes are still uncertain. Realised profit is calculated using the full cash flows received and any losses incurred, so that the analysis reflects the true economic impact of each lending decision.
+
+
+
+# Q1a – Policy Definition
+
+## Policy A – Safety-First Strategy
+
+```{r policyA}
+df <- df %>%
+  mutate(
+    approve_A = case_when(
+      grade %in% c("A","B","C") &
+      dti <= 25 &
+      funded_amnt <= 1.00 * annual_inc ~ TRUE,
+      TRUE ~ FALSE
+    ),
+    
+    approve_A = as.integer(approve_A),
+    
+    profit_A = approve_A * RealisedProfit
+  )
+```
+
+Policy A takes a cautious approach by applying stricter screening rules, particularly for borrowers with moderate credit risk. The goal is to limit potential losses and safeguard capital, even at the cost of lower approval volumes.
+
+
+
+## Policy B – Growth Strategy
+
+```{r policyB}
+df <- df %>%
+  mutate(
+    approve_B = case_when(
+      grade == "A" ~ (dti <= 40 & funded_amnt <= 1.00 * annual_inc),
+      grade == "B" ~ (dti <= 35 & funded_amnt <= 0.95 * annual_inc),
+      grade == "C" ~ (dti <= 32 & funded_amnt <= 0.80 * annual_inc),
+      grade == "D" ~ (dti <= 28 & funded_amnt <= 0.65 * annual_inc),
+      grade == "E" ~ (dti <= 25 & funded_amnt <= 0.50 * annual_inc),
+      grade == "F" ~ (dti <= 22 & funded_amnt <= 0.35 * annual_inc),
+      grade == "G" ~ (dti <= 20 & funded_amnt <= 0.20 * annual_inc),
+      TRUE ~ FALSE
+    ),
+    
+    approve_B = as.integer(approve_B),
+    
+    profit_B = approve_B * RealisedProfit
+  )
+```
+
+Policy B is designed to support growth by relaxing some approval thresholds and extending credit to a broader group of applicants. Affordability conditions remain in place, but the strategy accepts higher exposure in exchange for increased lending volume.
+
+
+
+# Q1b – Evaluation Metric & Hypothesis Testing
+
+## Primary Evaluation Metric
+
+Our primary evaluation metric is mean realised profit per application. This measures the average realised profit generated from each incoming loan application, treating rejected applications as contributing zero profit. Using this metric ensures that both approval volume and default losses are incorporated into the overall financial assessment.
+
+Let $\mu_A$ and $\mu_B$ represent the mean realised profit per application under Policy A and Policy B respectively. We test whether the two policies generate the same expected profit per application:
+ $$ H_0: \mu_A = \mu_B $$ 
+ 
+ $$ H_1: \mu_A \neq \mu_B $$
+
+
+
+```{r hypothesis_testing}
+primary_metric_summary <- data.frame(
+  Policy = c("Policy A", "Policy B"),
+  Mean_Profit_Per_Application = c(mean(df$profit_A),
+                                  mean(df$profit_B)),
+  SD = c(sd(df$profit_A),
+         sd(df$profit_B)),
+  Total_Profit = c(sum(df$profit_A),
+                   sum(df$profit_B))
+)
+
+print(primary_metric_summary)
+
+cat("\nWelch Two Sample t-test:\n")
+
+t_test_result <- t.test(df$profit_A,
+                        df$profit_B,
+                        paired = FALSE,
+                        var.equal = FALSE,
+                        alternative = "two.sided")
+
+print(t_test_result)
+```
+The Welch two-sample t-test indicates a statistically significant difference between the two policies (p < 0.001). On average, Policy B generates **approximately £298** more profit per application than Policy A, suggesting a materially stronger financial outcome under the growth-oriented strategy despite the higher default exposure.
+
+
+
+# Q1c – Policy Comparison
+
+```{r direct_comparison}
+policy_summary <- df %>%
+  summarise(
+    total_loans = n(),
+
+    loans_approved_A = sum(approve_A),
+    approval_rate_A = mean(approve_A),
+    default_rate_A = mean(default_flag[approve_A == 1]),
+    total_profit_A = sum(profit_A),
+    mean_profit_A = mean(profit_A),
+
+    loans_approved_B = sum(approve_B),
+    approval_rate_B = mean(approve_B),
+    default_rate_B = mean(default_flag[approve_B == 1]),
+    total_profit_B = sum(profit_B),
+    mean_profit_B = mean(profit_B)
+  )
+
+policy_summary
+```
+
+Although Policy B accepts a higher default rate, its substantially higher approval volume results in nearly 1.5 times greater expected profit per application compared to Policy A.
+
+
+
+# Confusion Matrices
+
+```{r confusion}
+conf_A <- confusionMatrix(
+  factor(ifelse(df$approve_A == 1, "Safe","Reject")),
+  factor(ifelse(df$default_flag == 0, "Safe","Reject")),
+  positive="Safe"
+)
+
+conf_B <- confusionMatrix(
+  factor(ifelse(df$approve_B == 1, "Safe","Reject")),
+  factor(ifelse(df$default_flag == 0, "Safe","Reject")),
+  positive="Safe"
+)
+
+conf_A
+conf_B
+```
+
+Policy A demonstrates stronger performance in rejecting high-risk applicants, while Policy B performs better in approving creditworthy borrowers.
+
+
+# Q1d – Limitations
+
+This analysis is based on a retrospective simulation using historical loan data rather than a live randomised controlled experiment. As a result, we do not directly observe how borrower behaviour might change under alternative approval rules. For example, if a growth-oriented strategy were implemented in practice, it could attract a different risk profile of applicants, altering default dynamics. In addition, the policies are evaluated under a specific historical economic environment. Changes in macroeconomic conditions, such as unemployment rates or interest rate cycles, could materially affect default rates and profitability. The decision rules themselves are also static and rule-based, rather than optimised using predictive modelling techniques, which may limit their efficiency relative to more advanced credit-scoring approaches. Finally, operational considerations, regulatory constraints, and capital requirements are not explicitly incorporated into this simulation. Therefore, while the statistical evidence strongly favours Policy B within this dataset, further validation — ideally through controlled pilot testing and stress testing under alternative economic scenarios — would be necessary before real-world implementation.
+
+
+
+# Conclusion
+
+Policy A takes a conservative stance, focusing on capital preservation and tighter risk control. In contrast, Policy B adopts a more expansion-oriented approach, accepting higher default exposure in exchange for substantially greater lending activity.
+
+The statistical analysis confirms that Policy B generates significantly higher profit per application within this historical sample. However, the appropriate strategy ultimately depends on the institution’s risk appetite, regulatory constraints, and broader strategic objectives. A lender with strong capital buffers and a growth mandate may favour Policy B, whereas a more risk-averse institution may prefer the stability offered by Policy A.
+
+
+
+
+# Q2a – Borrower Segmentation and Methodology
+
+To understand whether borrower risk is heterogeneous, we segment completed loans into clusters using borrower and loan characteristics. The same completed-loan sample is retained from Q1 so that the analysis is consistent across both questions. We use hierarchical clustering as an exploratory tool and K-means as the final segmentation method because it is more scalable for the full dataset.
+
+# Q2 Data Preparation
+
+```{r q2_data_preparation}
+loan_data <- df %>%
+  mutate(
+    loan_is_bad = default_flag,
+    meets_policy_A = case_when(
+      grade %in% c("A", "B", "C") & dti <= 25 & funded_amnt <= 1.00 * annual_inc ~ TRUE,
+      TRUE ~ FALSE
+    ),
+    meets_policy_B = case_when(
+      grade == "A" ~ (dti <= 40 & funded_amnt <= 1.00 * annual_inc),
+      grade == "B" ~ (dti <= 35 & funded_amnt <= 0.95 * annual_inc),
+      grade == "C" ~ (dti <= 32 & funded_amnt <= 0.80 * annual_inc),
+      grade == "D" ~ (dti <= 28 & funded_amnt <= 0.65 * annual_inc),
+      grade == "E" ~ (dti <= 25 & funded_amnt <= 0.50 * annual_inc),
+      grade == "F" ~ (dti <= 22 & funded_amnt <= 0.35 * annual_inc),
+      grade == "G" ~ (dti <= 20 & funded_amnt <= 0.20 * annual_inc),
+      TRUE ~ FALSE
+    ),
+    policy = case_when(
+      meets_policy_A ~ "Policy A",
+      meets_policy_B ~ "Policy B",
+      TRUE ~ "Rejected"
+    )
+  )
+
+print(table(loan_data$policy))
+```
+
+# Feature Selection
+
+The clustering variables capture affordability, borrowing behaviour, credit usage, and loan size. These variables are used to identify meaningful borrower segments that may differ in repayment risk and in their response to the two credit policies.
+
+```{r}
+clustering_vars <- c(
+  "funded_amnt", "annual_inc", "dti", "delinq_2yrs", "inq_last_6mths",
+  "open_acc", "pub_rec", "revol_bal", "revol_util", "total_acc", "int_rate"
+)
+
+cat("Variables selected for clustering:\n")
+for(i in 1:length(clustering_vars)) {
+  cat(sprintf("%2d. %-20s\n", i, clustering_vars[i]))
+}
+
+cluster_data <- loan_data %>%
+  select(id, all_of(clustering_vars), loan_is_bad, policy) %>%
+  na.omit()
+
+print(summary(cluster_data[, clustering_vars]))
+```
+
+# Outliers
+
+
+```{r mahalanobis_outlier_check}
+# Mahalanobis distance check for multivariate outliers
+
+X <- cluster_data %>%
+  select(all_of(clustering_vars)) %>%
+  as.data.frame()
+
+center <- colMeans(X, na.rm = TRUE)
+cov_mat <- cov(X, use = "complete.obs")
+
+md <- mahalanobis(X, center = center, cov = cov_mat)
+
+# Equivalent to p < 0.001
+p_values <- pchisq(md, df = length(clustering_vars), lower.tail = FALSE)
+
+# Flag outliers
+outlier_flag <- p_values < 0.001
+
+cat("Number of potential multivariate outliers removed:", sum(outlier_flag), "\n")
+cat("Percentage of potential multivariate outliers removed:",
+    round(100 * mean(outlier_flag), 2), "%\n")
+
+mahalanobis_summary <- data.frame(
+  observation = 1:nrow(X),
+  mahalanobis_distance = md,
+  p_value = p_values,
+  outlier_flag = outlier_flag
+)
+
+cat("\nTop 10 most extreme observations:\n")
+print(head(mahalanobis_summary[order(-mahalanobis_summary$mahalanobis_distance), ], 10))
+
+# Remove outliers from cluster_data
+cluster_data <- cluster_data[!outlier_flag, ]
+
+cat("\nRemaining observations after outlier removal:", nrow(cluster_data), "\n")
+
+```
+
+
+# Correlation and Standardisation
+
+We examine the correlation structure to understand overlap among variables and then standardise all clustering features so that variables measured on larger scales do not dominate the K-means algorithm.
+
+```{r}
+correlation_matrix <- cor(cluster_data[, clustering_vars])
+
+corrplot(correlation_matrix,
+         method = "color",
+         type = "upper",
+         tl.col = "black",
+         tl.srt = 45,
+         addCoef.col = "black",
+         number.cex = 0.7,
+         title = "Correlation Matrix",
+         mar = c(0, 0, 2, 0))
+
+cat("\nMULTICOLLINEARITY CHECK:\n")
+high_cor <- which(abs(correlation_matrix) > 0.75 & abs(correlation_matrix) < 1, arr.ind = TRUE)
+
+if(nrow(high_cor) > 0) {
+  cat("Found highly correlated variables (|r| > 0.75):\n")
+  for(i in 1:nrow(high_cor)) {
+    if(high_cor[i, 1] < high_cor[i, 2]) {
+      cat(rownames(correlation_matrix)[high_cor[i, 1]], "and",
+          colnames(correlation_matrix)[high_cor[i, 2]], ":",
+          round(correlation_matrix[high_cor[i, 1], high_cor[i, 2]], 3), "\n")
+    }
+  }
+} else {
+  cat("No highly correlated variables (|r| > 0.75) found.\n")
+}
+
+cluster_data_scaled <- cluster_data %>%
+  mutate(across(all_of(clustering_vars), scale)) %>%
+  as.data.frame()
+
+features_scaled <- cluster_data_scaled[, clustering_vars]
+
+cat("\nData standardised using z-score normalisation.\n")
+```
+
+# Exploratory Clustering
+
+For exploratory analysis, hierarchical clustering was applied to a random sample of the standardised dataset for computational convenience. The elbow method was then computed on the full standardised dataset, while silhouette analysis was conducted on a random subsample of up to 8,000 observations because pairwise distance calculations are computationally expensive for larger samples.
+
+```{r}
+# Exploratory Clustering
+
+set.seed(123)
+
+cat("Total observations used for clustering:", nrow(features_scaled), "\n\n")
+
+sample_hc <- min(1000, nrow(features_scaled))
+hc_sample_data <- features_scaled[sample(1:nrow(features_scaled), sample_hc), ]
+dist_mat <- dist(hc_sample_data, method = "euclidean")
+hc_model <- hclust(dist_mat, method = "ward.D2")
+
+plot(hc_model,
+     main = "Hierarchical Clustering Dendrogram",
+     xlab = "Observations",
+     sub = "",
+     cex = 0.5)
+
+rect.hclust(hc_model, k = 4, border = "red")
+```
+
+# Choosing the Number of Clusters
+
+We compare candidate cluster solutions using the elbow and silhouette criteria. The elbow method is computed on the full standardised dataset, while silhouette analysis is conducted on a random subsample of up to 8,000 observations for computational efficiency. The 2-, 3-, and 4-cluster solutions are then compared further using PCA visualisations and default-rate profiles for interpretability.
+
+```{r}
+wss <- numeric(10)
+for (k in 1:10) {
+  kmeans_model <- kmeans(features_scaled, centers = k, nstart = 25, iter.max = 100)
+  wss[k] <- kmeans_model$tot.withinss
+}
+
+plot(1:10, wss,
+     type = "b", pch = 19, frame = FALSE,
+     xlab = "Number of Clusters (k)",
+     ylab = "Total WSS",
+     main = "Elbow Method")
+grid()
+
+sample_size <- min(8000, nrow(features_scaled))
+sample_indices <- sample(1:nrow(features_scaled), sample_size)
+features_sample <- features_scaled[sample_indices, ]
+
+silhouette_scores <- numeric(9)
+for (k in 2:10) {
+  kmeans_model <- kmeans(features_sample, centers = k, nstart = 25)
+  sil <- silhouette(kmeans_model$cluster, dist(features_sample))
+  silhouette_scores[k - 1] <- mean(sil[, 3])
+}
+
+plot(2:10, silhouette_scores,
+     type = "b", pch = 19, frame = FALSE,
+     xlab = "Number of Clusters (k)",
+     ylab = "Average Silhouette Width",
+     main = "Silhouette Method")
+grid()
+
+data_driven_k <- which.max(silhouette_scores) + 1
+optimal_k <- data_driven_k
+
+cat("Data-driven recommended number of clusters:", data_driven_k, "\n")
+cat("Final number of clusters used for interpretation:", optimal_k, "\n")
+```
+
+# Comparison of K = 2, 3, and 4
+
+The following diagnostics compare the 2-, 3-, and 4-cluster solutions using average silhouette width as the primary statistical criterion, alongside PCA visualisations and default-rate profiles for interpretability.
+
+```{r}
+set.seed(123)
+
+# Fit candidate cluster solutions on the full standardised dataset
+km2 <- kmeans(features_scaled, centers = 2, nstart = 25, iter.max = 100)
+km3 <- kmeans(features_scaled, centers = 3, nstart = 25, iter.max = 100)
+km4 <- kmeans(features_scaled, centers = 4, nstart = 25, iter.max = 100)
+
+# Use a subsample for silhouette comparison to avoid memory issues
+sil_sample_size <- min(8000, nrow(features_scaled))
+sil_sample_idx <- sample(1:nrow(features_scaled), sil_sample_size)
+features_sil_sample <- features_scaled[sil_sample_idx, ]
+
+km2_s <- kmeans(features_sil_sample, centers = 2, nstart = 25)
+km3_s <- kmeans(features_sil_sample, centers = 3, nstart = 25)
+km4_s <- kmeans(features_sil_sample, centers = 4, nstart = 25)
+
+dist_sil_sample <- dist(features_sil_sample)
+
+sil_2 <- mean(silhouette(km2_s$cluster, dist_sil_sample)[, 3])
+sil_3 <- mean(silhouette(km3_s$cluster, dist_sil_sample)[, 3])
+sil_4 <- mean(silhouette(km4_s$cluster, dist_sil_sample)[, 3])
+
+sil_compare <- data.frame(
+  k = factor(c(2, 3, 4)),
+  avg_silhouette = c(sil_2, sil_3, sil_4)
+)
+
+ggplot(sil_compare, aes(x = k, y = avg_silhouette, fill = k)) +
+  geom_col(color = "black") +
+  geom_text(aes(label = round(avg_silhouette, 3)), vjust = -0.4) +
+  labs(title = "Average Silhouette Width for k = 2, 3, and 4",
+       x = "Number of Clusters",
+       y = "Average Silhouette Width") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+
+```
+
+# Q2b – Final Cluster Interpretation
+
+The final segmentation uses the selected value of 𝐾 based on silhouette performance and interpretability. The 3-cluster solution provides a clearer risk structure than 𝐾=2, while remaining more parsimonious and easier to interpret than 𝐾=4.
+```{r}
+set.seed(123)
+final_kmeans <- kmeans(features_scaled, centers = optimal_k, nstart = 50, iter.max = 100)
+cluster_data$cluster <- final_kmeans$cluster
+
+cat("Cluster Sizes:\n")
+print(table(final_kmeans$cluster))
+cat(sprintf("\nClustering Quality (BSS/TSS): %.2f%%\n",
+            100 * final_kmeans$betweenss / final_kmeans$totss))
+```
+
+```{r}
+cluster_profiles <- cluster_data %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    avg_funded_amnt = mean(funded_amnt),
+    avg_annual_inc = mean(annual_inc),
+    avg_dti = mean(dti),
+    avg_delinq_2yrs = mean(delinq_2yrs),
+    avg_inq_last_6mths = mean(inq_last_6mths),
+    avg_open_acc = mean(open_acc),
+    avg_pub_rec = mean(pub_rec),
+    avg_revol_bal = mean(revol_bal),
+    avg_revol_util = mean(revol_util),
+    avg_total_acc = mean(total_acc),
+    avg_int_rate = mean(int_rate),
+    default_rate = mean(loan_is_bad) * 100,
+    .groups = "drop"
+  )
+
+cat("CLUSTER PROFILES:\n")
+print(cluster_profiles)
+```
+
+```{r}
+cluster_labels <- cluster_profiles %>%
+  arrange(default_rate) %>%
+  mutate(
+    risk_rank = row_number(),
+    label = case_when(
+      risk_rank == 1 ~ "Low Risk - Prime Borrowers",
+      risk_rank == 2 ~ "Medium Risk Borrowers",
+      risk_rank == 3 ~ "High Risk - Subprime Borrowers"
+    )
+  ) %>%
+  select(cluster, label, default_rate)
+
+cat("CLUSTER LABELS:\n")
+print(cluster_labels)
+
+cluster_data <- cluster_data %>% left_join(cluster_labels, by = "cluster")
+```
+
+```{r export_q2_clusters}
+q2_cluster_export_with_labels <- cluster_data %>%
+  select(id, cluster) %>%
+  left_join(cluster_labels, by = "cluster")
+
+write.csv(q2_cluster_export_with_labels,
+          "q2_final_cluster_assignments_with_labels.csv",
+          row.names = FALSE)
+
+
+```
+
+```{r}
+contingency_table <- table(cluster_data$cluster, cluster_data$loan_is_bad)
+chi_test <- chisq.test(contingency_table)
+
+cat("Chi-Square Test (Cluster vs Default): p-value =", chi_test$p.value, "\n")
+if(chi_test$p.value < 0.05) {
+  cat("Conclusion: clusters differ significantly in default rates.\n")
+}
+```
+
+# Final Cluster Visualisation
+
+```{r}
+p1 <- ggplot(cluster_profiles, aes(x = factor(cluster), y = default_rate, fill = factor(cluster))) +
+  geom_bar(stat = "identity", color = "black") +
+  geom_text(aes(label = sprintf("%.2f%%", default_rate)), vjust = -0.5) +
+  labs(title = "Default Rate by Final Cluster", x = "Cluster", y = "Default Rate (%)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+p2 <- ggplot(cluster_profiles, aes(x = factor(cluster), y = avg_int_rate, fill = factor(cluster))) +
+  geom_bar(stat = "identity", color = "black") +
+  geom_text(aes(label = sprintf("%.2f%%", avg_int_rate)), vjust = -0.5) +
+  labs(title = "Average Interest Rate by Final Cluster", x = "Cluster", y = "Interest Rate (%)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+p3 <- ggplot(cluster_data, aes(x = factor(cluster), y = dti, fill = factor(cluster))) +
+  geom_boxplot() +
+  labs(title = "DTI by Final Cluster", x = "Cluster", y = "DTI (%)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+p4 <- ggplot(cluster_data, aes(x = factor(cluster), y = annual_inc, fill = factor(cluster))) +
+  geom_boxplot() +
+  labs(title = "Income by Final Cluster", x = "Cluster", y = "Annual Income") +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  scale_y_continuous(labels = dollar_format())
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+```
+
+# Q2c – Policy Performance by Cluster
+
+The final step compares how Policy A and Policy B perform within each borrower segment. This helps identify whether policy effectiveness differs across low-risk and high-risk groups.
+
+```{r}
+policy_cluster_performance <- cluster_data %>%
+  group_by(cluster, policy) %>%
+  summarise(
+    n = n(),
+    avg_funded_amnt = mean(funded_amnt),
+    avg_int_rate = mean(int_rate),
+    default_rate = mean(loan_is_bad) * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(cluster, policy)
+
+cat("POLICY PERFORMANCE BY CLUSTER:\n")
+print(policy_cluster_performance)
+```
+
+```{r}
+p_policy1 <- ggplot(policy_cluster_performance,
+                    aes(x = factor(cluster), y = default_rate, fill = policy)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black") +
+  geom_text(aes(label = sprintf("%.1f%%", default_rate)),
+            position = position_dodge(width = 0.9), vjust = -0.5, size = 3) +
+  labs(title = "Default Rate by Cluster and Policy", x = "Cluster", y = "Default Rate (%)") +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+p_policy2 <- ggplot(policy_cluster_performance,
+                    aes(x = factor(cluster), y = avg_int_rate, fill = policy)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black") +
+  geom_text(aes(label = sprintf("%.2f%%", avg_int_rate)),
+            position = position_dodge(width = 0.9), vjust = -0.5, size = 3) +
+  labs(title = "Interest Rate by Cluster and Policy", x = "Cluster", y = "Interest Rate (%)") +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+grid.arrange(p_policy1, p_policy2, ncol = 1)
+```
+
+```{r}
+policy_effects <- policy_cluster_performance %>%
+  select(cluster, policy, default_rate) %>%
+  pivot_wider(names_from = policy, values_from = default_rate) %>%
+  mutate(policy_difference = `Policy A` - `Policy B`)
+
+```
+
+```{r cluster_ab_summary_k3}
+# Attach final cluster assignments back to the full loan-level data
+loan_data_with_clusters <- loan_data %>%
+  left_join(cluster_data %>% select(id, cluster), by = "id")
+
+# Summary of Policy A vs Policy B within each cluster
+cluster_ab_summary <- loan_data_with_clusters %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    mean_profit_A = mean(profit_A),
+    mean_profit_B = mean(profit_B),
+    sd_profit_A = sd(profit_A),
+    sd_profit_B = sd(profit_B),
+    diff_B_minus_A = mean(profit_B) - mean(profit_A),
+    approval_rate_A = mean(approve_A),
+    approval_rate_B = mean(approve_B),
+    default_rate_A = mean(default_flag[approve_A == 1], na.rm = TRUE),
+    default_rate_B = mean(default_flag[approve_B == 1], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(cluster %in% c(1, 2, 3))
+
+cat("CLUSTER-LEVEL A/B SUMMARY (3-CLUSTER SOLUTION):\n")
+print(cluster_ab_summary)
+```
+
+# Welch A/B test within each of the 3 clusters
+```{r cluster_ab_tests_k3}
+cluster_test_results <- lapply(1:3, function(cl) {
+  
+  temp <- loan_data_with_clusters %>% filter(cluster == cl)
+  
+  test_result <- t.test(
+    temp$profit_A,
+    temp$profit_B,
+    paired = FALSE,
+    var.equal = FALSE,
+    alternative = "two.sided"
+  )
+  
+  data.frame(
+    cluster = cl,
+    n = nrow(temp),
+    mean_profit_A = mean(temp$profit_A),
+    mean_profit_B = mean(temp$profit_B),
+    diff_B_minus_A = mean(temp$profit_B) - mean(temp$profit_A),
+    t_statistic = as.numeric(test_result$statistic),
+    p_value = test_result$p.value,
+    conf_low = test_result$conf.int[1],
+    conf_high = test_result$conf.int[2]
+  )
+})
+
+cluster_test_results <- bind_rows(cluster_test_results)
+
+cat("CLUSTER-LEVEL A/B TEST RESULTS (3-CLUSTER SOLUTION):\n")
+print(cluster_test_results)
+```
+
+# Bar chart of mean realised profit in each of the 3 clusters
+```{r cluster_ab_plot_k3}
+cluster_ab_plot_data <- loan_data_with_clusters %>%
+  filter(cluster %in% c(1, 2, 3)) %>%
+  group_by(cluster) %>%
+  summarise(
+    mean_profit_A = mean(profit_A),
+    mean_profit_B = mean(profit_B),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c(mean_profit_A, mean_profit_B),
+    names_to = "policy",
+    values_to = "mean_profit"
+  ) %>%
+  mutate(
+    policy = recode(policy,
+                    mean_profit_A = "Policy A",
+                    mean_profit_B = "Policy B")
+  )
+
+ggplot(cluster_ab_plot_data,
+       aes(x = factor(cluster), y = mean_profit, fill = policy)) +
+  geom_col(position = "dodge", color = "black") +
+  geom_text(aes(label = round(mean_profit, 1)),
+            position = position_dodge(width = 0.9),
+            vjust = -0.4,
+            size = 3) +
+  labs(title = "Mean Realised Profit per Application by Cluster and Policy",
+       x = "Cluster",
+       y = "Mean Realised Profit per Application") +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+The cluster-level A/B analysis examines whether the relative performance of Policy A and Policy B is consistent across the three borrower segments identified by K-means clustering. For each cluster, mean realised profit per application is compared under the two policies using the same business metric as in Q1. This allows us to assess whether the aggregate advantage of one policy is consistent across all segments or driven mainly by particular borrower groups. If the difference is significant in some clusters but not others, this suggests that policy effectiveness is heterogeneous and that a differentiated lending strategy may be more appropriate than a single uniform policy.
+
+
+```{r}
+portfolio_composition <- cluster_data %>%
+  group_by(cluster, label) %>%
+  summarise(
+    count = n(),
+    percentage = n() / nrow(cluster_data) * 100,
+    total_loan_volume = sum(funded_amnt),
+    expected_losses = sum(funded_amnt * loan_is_bad),
+    .groups = "drop"
+  )
+
+cat("PORTFOLIO COMPOSITION:\n")
+print(portfolio_composition)
+
+ggplot(portfolio_composition, aes(x = "", y = percentage, fill = label)) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar("y", start = 0) +
+  geom_text(aes(label = sprintf("%s\n%.1f%%", cluster, percentage)),
+            position = position_stack(vjust = 0.5), size = 4) +
+  labs(title = "Portfolio Composition by Risk Cluster", fill = "Cluster Label") +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+# Q2 Summary
+
+The clustering analysis shows that borrower risk is not homogeneous across the portfolio. Using standardised borrower and loan characteristics, the final K-means segmentation identified three borrower groups with clearly different default-rate patterns. This suggests that the lending population contains meaningful underlying risk segments rather than a single uniform borrower profile.
+
+From a managerial perspective, the 3-cluster solution provides a useful balance between statistical quality and interpretability. Compared with a 2-cluster solution, it captures an additional middle-risk segment that would otherwise be hidden. Compared with a 4-cluster solution, it remains more parsimonious and easier to interpret for credit policy design. The cluster profiles and default-rate comparisons therefore support the conclusion that K = 3 is the most appropriate segmentation for this analysis.
+
+Most importantly, the results indicate that policy performance is not identical across borrower segments. This means that the aggregate comparison between Policy A and Policy B can conceal important differences across low-, medium-, and high-risk borrowers. Overall, Q2 provides evidence that a segmented lending strategy may be more effective than applying a single uniform policy.
+
+```{r}
+cat(sprintf("Total borrowers analysed: %s\n", format(nrow(cluster_data), big.mark = ",")))
+cat(sprintf("Final number of clusters selected: %d\n", optimal_k))
+cat(sprintf("Overall default rate: %.2f%%\n", mean(cluster_data$loan_is_bad) * 100))
+cat(sprintf("Cluster default rates range from %.2f%% to %.2f%%\n",
+            min(cluster_profiles$default_rate), max(cluster_profiles$default_rate)))
+cat("Conclusion: the 3-cluster solution reveals meaningful heterogeneity in borrower risk and policy performance.\n")
+```
+
+
+
